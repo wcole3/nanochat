@@ -135,3 +135,7 @@ log "Results saved to: $RESULTS_FILE"
 echo ""
 echo "Results:"
 column -t -s',' "$RESULTS_FILE"
+
+# -----------------------------------------------------------------------------
+# Generate Plots
+python -m scripts.plot_scaling "$RESULTS_FILE"

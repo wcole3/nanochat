@@ -1,18 +1,12 @@
 #!/bin/bash
 
-# This script is configured to train your own GPT-2 grade LLM (pretraining + finetuning)
-# It is designed to run on a blank 8XH100 GPU node and takes approximately 3 hours to complete.
-
-# 1) Example launch (simplest):
-# bash runs/speedrun.sh
-# 2) Example launch in a screen session (because the run takes ~3 hours):
-# screen -L -Logfile runs/speedrun.log -S speedrun bash runs/speedrun.sh
-# 3) Example launch with wandb logging, but see below for setting up wandb first:
-# WANDB_RUN=speedrun screen -L -Logfile runs/speedrun.log -S speedrun bash runs/speedrun.sh
+# This script is a local, single-GPU adaptation of the speedrun script.
+# It is configured to validte the entire pipeline on a consumer GPU.
+# This serves as a functional test of the end-to-end flow.
 
 # Default intermediate artifacts directory is in ~/.cache/nanochat
 export OMP_NUM_THREADS=1
-export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
+export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-$HOME/.cache/nanochat}"
 mkdir -p $NANOCHAT_BASE_DIR
 
 # -----------------------------------------------------------------------------
@@ -33,7 +27,7 @@ source .venv/bin/activate
 # 1) Make sure to first log in to wandb, e.g. run:
 #    `wandb login`
 # 2) Set the WANDB_RUN environment variable when running this script, e.g.:
-#    `WANDB_RUN=d26 bash speedrun.sh`
+#    `WANDB_RUN=d26 bash runs/speedrun_local.sh`
 if [ -z "$WANDB_RUN" ]; then
     # by default use "dummy" : it's handled as a special case, skips logging to wandb
     WANDB_RUN=dummy
@@ -48,48 +42,57 @@ python -m nanochat.report reset
 # -----------------------------------------------------------------------------
 # Tokenizer
 
-# Download the first ~2B characters of pretraining dataset
-# each data shard is ~250M chars
-# so we download 2e9 / 250e6 = 8 data shards at this point
-# each shard is ~100MB of text (compressed), so this is about ~800MB of data on disk
-# look at dev/repackage_data_reference.py for details on how this data was prepared
-python -m nanochat.dataset -n 8
-# Immediately also kick off downloading more shards in the background while tokenizer trains
-# Approximately 150 shards are needed for GPT-2 capability pretraining, add 20 for padding.
-# The maximum total number of shards available in the entire dataset is 6542.
-python -m nanochat.dataset -n 170 &
-DATASET_DOWNLOAD_PID=$!
-# train the tokenizer with vocab size 2**15 = 32768 on ~2B characters of data
-python -m scripts.tok_train
+# Download just 10 shards (approx 100MB compressed) for a local test
+# This is enough to train a tokenizer and run a small training loop.
+echo "Downloading data..."
+python -m nanochat.dataset -n 10
+
+# Train tokenizer on this small subset
+echo "Training tokenizer..."
+python -m scripts.tok_train --vocab-size=4096 --max-chars=10000000
 # evaluate the tokenizer (report compression ratio etc.)
 python -m scripts.tok_eval
 
 # -----------------------------------------------------------------------------
 # Base model (pretraining)
-echo "Waiting for dataset download to complete..."
-wait $DATASET_DOWNLOAD_PID
 
-# d24 model (slightly undertrained to beat GPT-2 => decrease data:params ratio from compute optimal 10.5 (default) to 8)
-torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- --depth=24 --target-param-data-ratio=8 --device-batch-size=16 --fp8 --run=$WANDB_RUN
+# Train a small model for local testing
+# Reduced depth, batch size, and target data ratio for quick execution
+echo "Starting base model training..."
+# Using python directly for single GPU
+python -m scripts.base_train \
+    --depth=8 \
+    --target-param-data-ratio=1.0 \
+    --device-batch-size=8 \
+    --total-batch-size=65536 \
+    --max-seq-len=1024 \
+    --eval-tokens=102400 \
+    --num-iterations=100 \
+    --eval-every=20 \
+    --save-every=50 \
+    --run=$WANDB_RUN
+
 # evaluate the model: CORE metric, BPB on train/val, and draw samples
-torchrun --standalone --nproc_per_node=8 -m scripts.base_eval -- --device-batch-size=16
+echo "Evaluating base model..."
+python -m scripts.base_eval --device-batch-size=8 --max-seq-len=1024
 
 # -----------------------------------------------------------------------------
 # SFT (teach the model conversation special tokens, tool use, multiple choice)
 
 # download 2.3MB of synthetic identity conversations to impart a personality to nanochat
-# see dev/gen_synthetic_data.py for details on how this data was prepared and to get a sense of how you can easily tune it
+echo "Downloading sft data..."
 curl -L -o $NANOCHAT_BASE_DIR/identity_conversations.jsonl https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl
 
 # run SFT and eval the model
-torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft -- --device-batch-size=16 --run=$WANDB_RUN
-torchrun --standalone --nproc_per_node=8 -m scripts.chat_eval -- -i sft
+echo "Starting SFT..."
+python -m scripts.chat_sft \
+    --device-batch-size=8 \
+    --run=$WANDB_RUN \
+    --learning-rate=1e-4 \
+    --num-iterations=50
 
-# chat with the model over CLI! Leave out the -p to chat interactively
-# python -m scripts.chat_cli -p "Why is the sky blue?"
-
-# even better, chat with your model over a pretty WebUI ChatGPT style
-# python -m scripts.chat_web
+echo "Evaluating SFT model..."
+python -m scripts.chat_eval --device-batch-size=8 -i sft
 
 # -----------------------------------------------------------------------------
 # Generate the full report by putting together all the sections
